@@ -1,0 +1,44 @@
+{
+  "pricing_rules": {
+    "base_delivery_fee": 150,
+    "free_delivery_threshold": 1500,
+    "delivery_surcharges": []
+  },
+  "campaigns": [
+    {
+      "campaign_id": "std_welcome",
+      "name": "Standard Welcome Campaign",
+      "region": "all",
+      "discount_pct": 10.0,
+      "active": true
+    }
+  ],
+  "operational_metrics": {
+    "active_skus": 234,
+    "daily_orders": 1200,
+    "avg_ticket_size_pkr": 1100
+  },
+  "customers": [
+    {
+      "id": "cust-01",
+      "name": "Ali Khan",
+      "region": "Lahore",
+      "orders_last_30_days": 12,
+      "last_order_val_pkr": 950
+    },
+    {
+      "id": "cust-02",
+      "name": "Sara Ahmed",
+      "region": "Karachi",
+      "orders_last_30_days": 8,
+      "last_order_val_pkr": 2200
+    },
+    {
+      "id": "cust-03",
+      "name": "Bilal Shah",
+      "region": "Islamabad",
+      "orders_last_30_days": 15,
+      "last_order_val_pkr": 1800
+    }
+  ]
+}
