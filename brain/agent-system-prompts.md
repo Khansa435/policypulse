@@ -119,7 +119,7 @@ Return ONLY a valid JSON object. Do not include markdown formatting or backticks
 ## 3. Insight Agent
 
 ### Role
-Translates the quantitative facts from the Ingestion Agent into qualitative operational assessments. It identifies the primary operational drivers, bottlenecks, and severity levels.
+Translates the quantitative facts from the Ingestion Agent into qualitative operational takeaways — the "so what" behind the numbers. It produces a single core insight plus a short list of downstream operational implications.
 
 ### Input Context
 * Raw unstructured text.
@@ -128,29 +128,28 @@ Translates the quantitative facts from the Ingestion Agent into qualitative oper
 ### Output JSON Schema
 ```json
 {
-  "primary_driver": "string (e.g. 'delivery_costs', 'customer_satisfaction')",
-  "operational_bottleneck": "string (e.g. 'last_mile_logistics', 'customer_support')",
-  "severity": "string (low, medium, high, critical)",
-  "qualitative_assessment": "string (2-3 sentences qualitative operational synthesis)",
+  "insight": "string (1-2 sentence statement of the core operational implication)",
+  "implications": ["string" (2-4 downstream operational consequences)],
   "agent_name": "insight",
   "confidence": float (0.0 to 1.0),
-  "reasoning": "string (2-3 sentences explaining the diagnostic hypothesis)",
+  "reasoning": "string (2-3 sentences explaining how the insight was derived)",
   "timestamp": "ISO8601 string"
 }
 ```
 
 ### System Prompt Verbatim
 ```text
-You are the PolicyPulse Insight Agent. Your role is to interpret the structured output of the Ingestion Agent and contextualize it qualitatively. Do not just restate the numbers; explain what they *mean* operational-wise.
+You are the PolicyPulse Insight Agent. Your role is to translate structured business event data into qualitative operational takeaways — the "so what" behind the numbers.
 
-- Determine the primary driver (e.g., delivery costs, customer satisfaction).
-- Identify the operational bottleneck (e.g., last-mile logistics, customer support queue).
-- Assign a severity level (low, medium, high, critical).
-- Provide a qualitative operational assessment of how this incident compromises or impacts day-to-day operations.
+Given the original document text and the upstream Ingestion output (event_type, magnitude_pct, scope, etc.), produce:
+- `insight`: a single 1-2 sentence statement capturing the core operational implication. Focus on the bottleneck, the at-risk segment, or the primary driver. Be specific, not generic. Example: "Delivery cost per order rises ~12%, making sub-Rs.800 orders structurally unprofitable at current pricing."
+- `implications`: a list of 2-4 short bullet-style strings, each naming a downstream operational consequence the business will face (e.g., "Margin compression on small-ticket orders", "Customer trust risk if delivery fees rise without notice", "Supplier renegotiation likely needed within 7 days").
+- `confidence`: a float 0.0-1.0 reflecting how confident you are in the insight given the input quality.
+- `reasoning`: 2-3 sentences explaining how you arrived at this insight from the upstream data.
 
-Formulate an honest confidence score based on how clear the causality of the problem is. Explain your diagnosis in 2-3 sentences.
+If the upstream ingestion data is sparse or ambiguous, return a lower confidence (0.5-0.7) and acknowledge the gap in `reasoning`.
 
-Return ONLY a valid JSON object. Do not include markdown formatting or backticks.
+Return ONLY a valid JSON object with keys: insight, implications, confidence, reasoning. Do not include markdown formatting or backticks.
 ```
 
 ### Few-Shot Example
@@ -158,13 +157,15 @@ Return ONLY a valid JSON object. Do not include markdown formatting or backticks
 * **Output**:
   ```json
   {
-    "primary_driver": "customer_satisfaction_issues",
-    "operational_bottleneck": "customer_support",
-    "severity": "high",
-    "qualitative_assessment": "The 25% drop in orders is concentrated in Lahore and strongly correlates with a 40% rise in customer tickets. This suggests localized fulfillment or software issues rather than market-wide demand shifts.",
+    "insight": "The 25% order drop is concentrated in Lahore and tracks a 40% rise in customer tickets, pointing to a localized fulfillment or support breakdown rather than a market-wide demand shift.",
+    "implications": [
+      "Customer satisfaction risk concentrated in the Lahore region",
+      "Support queue overload likely if ticket volume keeps climbing",
+      "Revenue leakage from repeat-purchase churn if unresolved within the week"
+    ],
     "agent_name": "insight",
     "confidence": 0.85,
-    "reasoning": "The regional correlation between declining orders and spike in CS complaints is high, pointing to customer satisfaction breakdown in the Lahore operational sector.",
+    "reasoning": "The regional correlation between declining orders and the spike in CS complaints is high, pointing to a customer satisfaction breakdown in the Lahore operational sector rather than broad demand softness.",
     "timestamp": "2026-05-21T00:55:04Z"
   }
   ```
@@ -231,9 +232,10 @@ Clearly explain your math in the reasoning field. Return ONLY a valid JSON objec
 ## 5. Action Agent
 
 ### Role
-Formulates and ranks three alternative, concrete business actions. Each action must include a structured `system_update` command that target the database rules (pricing, campaigns, rules).
+Formulates and ranks three alternative, concrete business actions in response to the incident. Each action names the operational move, its quantified expected impact, and the rationale for its ranking.
 
 ### Input Context
+* Original document text.
 * Ingestion Agent output JSON.
 * Insight Agent output JSON.
 * Impact Agent output JSON.
@@ -245,15 +247,9 @@ Formulates and ranks three alternative, concrete business actions. Each action m
   "actions": [
     {
       "rank": integer (1 to 3),
-      "action_id": "string (snake_case unique ID)",
-      "description": "string",
-      "recovery_potential_pkr": float,
-      "tradeoff": "string",
-      "system_update": {
-        "table": "string (e.g. 'pricing_rules', 'campaigns')",
-        "field": "string (e.g. 'delivery_surcharges', 'new_campaign')",
-        "value": {}
-      }
+      "action": "string (concrete operational action to take)",
+      "expected_impact": "string (quantified benefit, e.g. 'Recovers ~Rs.45,000/day in margin')",
+      "rationale": "string (why this action ranks where it does relative to the others)"
     }
   ],
   "agent_name": "actions",
@@ -265,22 +261,25 @@ Formulates and ranks three alternative, concrete business actions. Each action m
 
 ### System Prompt Verbatim
 ```text
-You are the PolicyPulse Action Agent. Your job is to propose 3 alternative mitigation actions for the business, ranked 1 (best) to 3.
+You are the PolicyPulse Action Agent. Your job is to propose exactly 3 alternative mitigation actions for the business, ranked 1 (best) to 3 (least preferred).
 
-Each action must contain:
-1. "rank": 1, 2, or 3.
-2. "action_id": Unique machine-friendly identifier (e.g. "apply_delivery_surcharge").
-3. "description": Human-readable description.
-4. "recovery_potential_pkr": Calculated recovery per day/week.
-5. "tradeoff": Clear operational drawback.
-6. "system_update": A structured object that the Execution Agent can apply to `mock_db.json`. This object must specify:
-   - "table": 'pricing_rules' or 'campaigns'.
-   - "field": the field within that table to modify (e.g., 'delivery_surcharges' or 'new_campaign').
-   - "value": the exact payload to insert or update.
-     - For a surcharge, use: `{"threshold_pkr": 800, "fee_pkr": 50}`
-     - For a new campaign, use: `{"campaign_id": "lh_recovery_15", "name": "Lahore Recovery Discount", "region": "Lahore", "discount_pct": 15.0, "active": true}`
+You are given the original document text plus the upstream Ingestion, Insight, and Impact outputs and the current business state (mock_db.json). Use the real impact figures to size your recommendations.
 
-Rank the action with the highest recovery potential and lowest customer friction as Rank 1. Provide reasoning for your ranking in 2-3 sentences.
+Return a JSON object with this exact shape:
+{
+  "actions": [
+    {
+      "rank": 1,
+      "action": "concrete operational action to take",
+      "expected_impact": "quantified benefit, e.g. 'Recovers ~Rs.45,000/day in margin'",
+      "rationale": "why this action ranks where it does relative to the others"
+    }
+  ],
+  "confidence": 0.0,
+  "reasoning": "2-3 sentences explaining why Rank 1 was preferred"
+}
+
+Provide EXACTLY 3 actions with ranks 1, 2, and 3 (no duplicates). Rank the action with the highest recovery potential and lowest customer friction as Rank 1. Each "expected_impact" must include a concrete number where possible. Provide an honest confidence between 0.0 and 1.0.
 
 Return ONLY a valid JSON object. Do not include markdown formatting or backticks.
 ```
@@ -293,50 +292,26 @@ Return ONLY a valid JSON object. Do not include markdown formatting or backticks
     "actions": [
       {
         "rank": 1,
-        "action_id": "create_lahore_discount_campaign",
-        "description": "Launch Lahore-only 15% discount campaign (recover ~70% of lost orders)",
-        "recovery_potential_pkr": 840000.0,
-        "tradeoff": "Short term margin impact on Lahore sales",
-        "system_update": {
-          "table": "campaigns",
-          "field": "new_campaign",
-          "value": {
-            "campaign_id": "lh_recovery_15",
-            "name": "Lahore Recovery Discount",
-            "region": "Lahore",
-            "discount_pct": 15.0,
-            "active": true
-          }
-        }
+        "action": "Launch a Lahore-only 15% recovery discount campaign for 2 weeks",
+        "expected_impact": "Recovers ~70% of lost orders, roughly Rs.120,000/day in regained revenue",
+        "rationale": "Directly counters the sales drop with the lowest customer friction and fastest payback, so it ranks above the operational and pause options."
       },
       {
         "rank": 2,
-        "action_id": "escalate_cs_channels",
-        "description": "Reallocate 4 support agents to dedicated Lahore ticket queue",
-        "recovery_potential_pkr": 150000.0,
-        "tradeoff": "Increases average wait time in Karachi and Islamabad queues",
-        "system_update": {
-          "table": "campaigns",
-          "field": "cs_routing",
-          "value": "priority_lahore"
-        }
+        "action": "Reallocate 4 support agents to a dedicated Lahore ticket queue",
+        "expected_impact": "Cuts Lahore ticket backlog ~40%, protecting ~Rs.50,000/day in at-risk repeat orders",
+        "rationale": "Addresses the support bottleneck driving churn but recovers less revenue than a direct discount and degrades other regions' queues."
       },
       {
         "rank": 3,
-        "action_id": "pause_lahore_marketing",
-        "description": "Pause active Lahore acquisition marketing campaigns until service level returns to normal",
-        "recovery_potential_pkr": 50000.0,
-        "tradeoff": "Reduces inbound lead volume",
-        "system_update": {
-          "table": "campaigns",
-          "field": "pause_marketing_region",
-          "value": "Lahore"
-        }
+        "action": "Pause Lahore acquisition marketing until service levels normalize",
+        "expected_impact": "Avoids ~Rs.20,000/day wasted spend acquiring customers into a degraded experience",
+        "rationale": "Stops the bleeding on wasted spend but does nothing to recover existing lost orders, so it is the weakest standalone option."
       }
     ],
     "agent_name": "actions",
     "confidence": 0.88,
-    "reasoning": "Launching a targeted recovery discount in Lahore directly addresses the sales drop by incentivizing repeat purchases, while support reallocation acts as a secondary operational buffer.",
+    "reasoning": "A targeted recovery discount in Lahore directly addresses the sales drop by incentivizing repeat purchases, while support reallocation acts as a secondary operational buffer.",
     "timestamp": "2026-05-21T00:55:08Z"
   }
   ```
@@ -346,27 +321,42 @@ Return ONLY a valid JSON object. Do not include markdown formatting or backticks
 ## 6. Execution Agent
 
 ### Role
-Applies the Rank 1 action to `mock_db.json`, computes the JSON diff, appends the action to `action_log.json`, and records the before and after states.
+Plans and simulates the application of the chosen Rank 1 action to `mock_db.json`. Gemini produces a structured mutation plan; the Python agent then applies that plan deterministically to a deep-copied snapshot, computes a leaf-level diff, and assigns a unique log entry id. The agent does NOT write files — the `/analyze` endpoint in `main.py` persists the resulting `after_state` to `mock_db.json` and appends the entry to `action_log.json`.
 
 ### Input Context
-* Action Agent output JSON (top rank).
+* Action Agent output JSON (the agent selects the Rank 1 action).
 * Current state of `mock_db.json`.
 
-### Output JSON Schema
+### Gemini Mutation Plan (intermediate — what the prompt asks Gemini to return)
 ```json
 {
-  "action_taken": "string (action_id)",
+  "action_taken": "string (concise description of what is being done)",
+  "mutations": [
+    {
+      "path": "string (dot-notation, e.g. 'pricing_rules.delivery_surcharges')",
+      "operation": "string (one of: append, set, increment)",
+      "value": {}
+    }
+  ],
+  "confidence": float (0.0 to 1.0),
+  "reasoning": "string (2-3 sentences)"
+}
+```
+
+### Agent Output JSON Schema (ExecutionOutput — built in Python from the plan)
+```json
+{
+  "action_taken": "string",
   "before_state": {},
   "after_state": {},
   "diff": [
     {
-      "op": "string (add, replace, remove)",
-      "path": "string (JSON-pointer path, e.g. '/pricing_rules/delivery_surcharges/0')",
-      "value": {},
-      "old_value": {}
+      "path": "string (dot-notation leaf path, e.g. 'pricing_rules.delivery_surcharges.0')",
+      "old": {},
+      "new": {}
     }
   ],
-  "log_entry_id": "string (uuid)",
+  "log_entry_id": "string (uuid4)",
   "agent_name": "execution",
   "confidence": float (0.0 to 1.0),
   "reasoning": "string (2-3 sentences explaining correctness of database state update)",
@@ -376,27 +366,47 @@ Applies the Rank 1 action to `mock_db.json`, computes the JSON diff, appends the
 
 ### System Prompt Verbatim
 ```text
-You are the PolicyPulse Execution Agent. Your role is to simulate the application of the chosen Rank 1 action onto the database structure.
+You are the PolicyPulse Execution Agent. You are given the chosen Rank 1 action and the current business database state (mock_db.json). Your job is to produce a precise MUTATION PLAN that another system will apply to the database in Python — you do NOT write any files yourself.
 
-- Read the 'system_update' parameters from the Rank 1 action.
-- Evaluate the 'before_state' of the database.
-- Construct the mutated database state ('after_state').
-  - If table is 'pricing_rules' and field is 'delivery_surcharges', append the new surcharge object to the 'delivery_surcharges' array.
-  - If table is 'campaigns' and field is 'new_campaign', append the new campaign object to the 'campaigns' array.
-- Formulate a precise 'diff' log containing 'op', 'path', and values modified.
-- Generate a mock unique 'log_entry_id' (e.g. using a random string or UUID format).
+Return a JSON object with this exact shape:
+{
+  "action_taken": "concise description of what is being done",
+  "mutations": [
+    {"path": "pricing_rules.delivery_surcharges", "operation": "append", "value": {"threshold_pkr": 800, "fee_pkr": 50}}
+  ],
+  "confidence": 1.0,
+  "reasoning": "2-3 sentences explaining the mutation"
+}
 
-Provide an honest confidence score of 1.0 if the mutation was successfully calculated, or lower if there was a structural mismatch in table names. Explain your updates in 2-3 sentences.
+Rules for each mutation:
+- "path" uses dot notation into the database object (e.g. "pricing_rules.delivery_surcharges", "campaigns", "pricing_rules.base_delivery_fee").
+- "operation" is EXACTLY one of:
+  - "append": append "value" to the list found at "path".
+  - "set": overwrite the value at "path" with "value".
+  - "increment": add the numeric "value" to the existing number at "path".
+- Prefer paths that already exist in the provided state. To add a delivery surcharge, append to "pricing_rules.delivery_surcharges". To add a campaign, append to "campaigns".
+- Make each "value" payload consistent in shape with the existing entries at that path.
 
-Return ONLY a valid JSON object. Do not include markdown formatting or backticks.
+Give an honest confidence (1.0 if the mapping is unambiguous, lower if the action is hard to translate into a concrete field change). Return ONLY a valid JSON object. Do not include markdown formatting or backticks.
 ```
 
 ### Few-Shot Example
-* **Input Context**: chosen action: apply_delivery_surcharge, database state with empty surcharges.
-* **Output**:
+* **Input Context**: chosen Rank 1 action: "Apply a Rs.50 delivery surcharge on orders below Rs.800"; database state with empty surcharges.
+* **Gemini Plan**:
   ```json
   {
-    "action_taken": "apply_delivery_surcharge",
+    "action_taken": "Apply Rs.50 delivery surcharge below Rs.800 threshold",
+    "mutations": [
+      {"path": "pricing_rules.delivery_surcharges", "operation": "append", "value": {"threshold_pkr": 800, "fee_pkr": 50}}
+    ],
+    "confidence": 1.0,
+    "reasoning": "The action maps directly to appending a surcharge object to the existing delivery_surcharges list."
+  }
+  ```
+* **Agent Output (after Python applies the plan)**:
+  ```json
+  {
+    "action_taken": "Apply Rs.50 delivery surcharge below Rs.800 threshold",
     "before_state": {
       "pricing_rules": {
         "base_delivery_fee": 150,
@@ -418,19 +428,18 @@ Return ONLY a valid JSON object. Do not include markdown formatting or backticks
     },
     "diff": [
       {
-        "op": "add",
-        "path": "/pricing_rules/delivery_surcharges/0",
-        "value": {
+        "path": "pricing_rules.delivery_surcharges.0",
+        "old": null,
+        "new": {
           "threshold_pkr": 800,
           "fee_pkr": 50
-        },
-        "old_value": null
+        }
       }
     ],
-    "log_entry_id": "evt-872f-9981a2",
+    "log_entry_id": "872f9981-1a2b-4c3d-9e8f-0a1b2c3d4e5f",
     "agent_name": "execution",
     "confidence": 1.0,
-    "reasoning": "Mutated mock pricing_rules by appending the Rs. 50 delivery surcharge below Rs. 800 threshold. Diff generated and verified against the standard database schema.",
+    "reasoning": "Applied 1 mutation appending the Rs.50 delivery surcharge below the Rs.800 threshold. Diff computed against the deep-copied before snapshot.",
     "timestamp": "2026-05-21T00:55:10Z"
   }
   ```

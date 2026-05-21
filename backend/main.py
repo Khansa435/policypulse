@@ -1,9 +1,8 @@
 """
 PolicyPulse FastAPI backend.
 
-Exposes health, state inspection, and reset endpoints over the local JSON mock
-database. The /analyze endpoint is intentionally not wired up yet — it will be
-added once the agent pipeline is in place.
+Exposes health, state inspection, reset, and the full six-agent /analyze
+pipeline over the local JSON mock database.
 """
 
 from __future__ import annotations
@@ -11,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,15 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+from agents.action_agent import ActionAgent
+from agents.base_agent import AgentResponse, AnalyzeRequest, PipelineResponse
+from agents.execution_agent import ExecutionAgent
+from agents.impact_agent import ImpactAgent
+from agents.ingestion_agent import IngestionAgent
+from agents.insight_agent import InsightAgent
+from agents.orchestrator_agent import OrchestratorAgent
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -46,9 +56,28 @@ app.add_middleware(
 
 db_lock = asyncio.Lock()
 
+orchestrator = OrchestratorAgent()
+ingestion = IngestionAgent()
+insight = InsightAgent()
+impact = ImpactAgent()
+action = ActionAgent()
+execution = ExecutionAgent()
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _output_to_dict(response: AgentResponse | None) -> dict:
+    """Normalize an agent response's output into a plain dict for downstream context."""
+    if response is None or response.output is None:
+        return {}
+    output = response.output
+    if isinstance(output, BaseModel):
+        return output.model_dump()
+    if isinstance(output, dict):
+        return output
+    return {}
 
 
 def _read_json(path: Path) -> Any:
@@ -125,6 +154,200 @@ async def reset() -> Any:
             MOCK_DB_BAK_PATH.name,
         )
         return {"status": "reset_complete", "timestamp": _now_iso()}
+
+
+@app.post("/analyze", response_model=PipelineResponse)
+async def analyze(request: AnalyzeRequest) -> Any:
+    request_id = str(uuid.uuid4())
+    start = time.perf_counter()
+    text = request.text
+    agent_trace: list[AgentResponse] = []
+
+    def _elapsed_ms() -> int:
+        return int((time.perf_counter() - start) * 1000)
+
+    try:
+        # STEP A — orchestrator: decide relevance / whether to halt.
+        logger.info("[%s] orchestrator start", request_id)
+        orchestrator_response = await asyncio.to_thread(
+            orchestrator.run, {"text": text}, None
+        )
+        agent_trace.append(orchestrator_response)
+        logger.info(
+            "[%s] orchestrator end confidence=%s",
+            request_id,
+            orchestrator_response.confidence,
+        )
+
+        should_halt = bool(
+            getattr(orchestrator_response.output, "should_halt", False)
+        )
+        if should_halt:
+            logger.info("[%s] orchestrator halted pipeline", request_id)
+            return PipelineResponse(
+                request_id=request_id,
+                input_text=text,
+                orchestrator=orchestrator_response,
+                agent_trace=agent_trace,
+                total_duration_ms=_elapsed_ms(),
+            )
+
+        # STEP B — ingestion: extract structured event facts.
+        logger.info("[%s] ingestion start", request_id)
+        ingestion_response = await asyncio.to_thread(
+            ingestion.run, {"text": text}, None
+        )
+        agent_trace.append(ingestion_response)
+        logger.info(
+            "[%s] ingestion end confidence=%s",
+            request_id,
+            ingestion_response.confidence,
+        )
+        ingestion_dict = _output_to_dict(ingestion_response)
+
+        # STEP C — snapshot the current DB state under the lock, then release.
+        async with db_lock:
+            try:
+                mock_db_state = _read_json(MOCK_DB_PATH)
+            except (FileNotFoundError, json.JSONDecodeError):
+                logger.exception(
+                    "[%s] could not read mock_db.json snapshot", request_id
+                )
+                mock_db_state = {}
+
+        # STEP D — insight: qualitative takeaways from ingestion.
+        logger.info("[%s] insight start", request_id)
+        insight_response = await asyncio.to_thread(
+            insight.run,
+            {"text": text},
+            {"ingestion": ingestion_dict},
+        )
+        agent_trace.append(insight_response)
+        logger.info(
+            "[%s] insight end confidence=%s",
+            request_id,
+            insight_response.confidence,
+        )
+        insight_dict = _output_to_dict(insight_response)
+
+        # STEP E — impact: quantitative impact against real DB state.
+        logger.info("[%s] impact start", request_id)
+        impact_response = await asyncio.to_thread(
+            impact.run,
+            {"text": text},
+            {
+                "ingestion": ingestion_dict,
+                "insight": insight_dict,
+                "mock_db_state": mock_db_state,
+            },
+        )
+        agent_trace.append(impact_response)
+        logger.info(
+            "[%s] impact end confidence=%s",
+            request_id,
+            impact_response.confidence,
+        )
+        impact_dict = _output_to_dict(impact_response)
+
+        # STEP F — action: three ranked mitigation actions.
+        logger.info("[%s] action start", request_id)
+        action_response = await asyncio.to_thread(
+            action.run,
+            {"text": text},
+            {
+                "ingestion": ingestion_dict,
+                "insight": insight_dict,
+                "impact": impact_dict,
+                "mock_db_state": mock_db_state,
+            },
+        )
+        agent_trace.append(action_response)
+        logger.info(
+            "[%s] action end confidence=%s",
+            request_id,
+            action_response.confidence,
+        )
+        action_dict = _output_to_dict(action_response)
+
+        # STEP G — execution: plan + simulate the Rank 1 mutation.
+        logger.info("[%s] execution start", request_id)
+        execution_response = await asyncio.to_thread(
+            execution.run,
+            {"text": text},
+            {"actions": action_dict, "mock_db_state": mock_db_state},
+        )
+        agent_trace.append(execution_response)
+        logger.info(
+            "[%s] execution end confidence=%s",
+            request_id,
+            execution_response.confidence,
+        )
+
+        # STEP H — persist the mutated state and append an audit log entry.
+        execution_output = execution_response.output
+        if execution_output is not None:
+            async with db_lock:
+                try:
+                    _write_json(MOCK_DB_PATH, execution_output.after_state)
+
+                    try:
+                        log = _read_json(ACTION_LOG_PATH)
+                        if not isinstance(log, list):
+                            log = []
+                    except (FileNotFoundError, json.JSONDecodeError):
+                        log = []
+
+                    log.append(
+                        {
+                            "log_entry_id": execution_output.log_entry_id,
+                            "request_id": request_id,
+                            "timestamp": _now_iso(),
+                            "action_taken": execution_output.action_taken,
+                            "agent_trace_summary": [
+                                {
+                                    "agent_name": r.agent_name,
+                                    "confidence": r.confidence,
+                                }
+                                for r in agent_trace
+                            ],
+                        }
+                    )
+                    _write_json(ACTION_LOG_PATH, log)
+                    logger.info(
+                        "[%s] persisted after_state; logged entry %s",
+                        request_id,
+                        execution_output.log_entry_id,
+                    )
+                except OSError:
+                    logger.exception(
+                        "[%s] failed to persist execution result", request_id
+                    )
+        else:
+            logger.warning(
+                "[%s] execution produced no output; skipping persistence",
+                request_id,
+            )
+
+        # STEP I — assemble the full pipeline response.
+        return PipelineResponse(
+            request_id=request_id,
+            input_text=text,
+            orchestrator=orchestrator_response,
+            ingestion=ingestion_response,
+            insight=insight_response,
+            impact=impact_response,
+            actions=action_response,
+            execution=execution_response,
+            agent_trace=agent_trace,
+            total_duration_ms=_elapsed_ms(),
+        )
+
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[%s] /analyze pipeline failed", request_id)
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(exc), "request_id": request_id},
+        )
 
 
 if __name__ == "__main__":
